@@ -103,6 +103,8 @@ enum freertos_symbol_values {
 	FREERTOS_VAL_UX_CURRENT_NUMBER_OF_TASKS = 9,
 	FREERTOS_VAL_UX_TOP_USED_PRIORITY = 10,
 	FREERTOS_VAL_X_SCHEDULER_RUNNING = 11,
+	FREERTOS_VAL_PX_CURRENT_TCBS = 12,
+	FREERTOS_VAL_UX_TASK_NAME_OFFSET = 13,
 };
 
 struct symbols {
@@ -111,7 +113,7 @@ struct symbols {
 };
 
 static const struct symbols freertos_symbol_list[] = {
-	{ "pxCurrentTCB", false },
+	{ "pxCurrentTCB", true },
 	{ "pxReadyTasksLists", false },
 	{ "xDelayedTaskList1", false },
 	{ "xDelayedTaskList2", false },
@@ -123,6 +125,8 @@ static const struct symbols freertos_symbol_list[] = {
 	{ "uxCurrentNumberOfTasks", false },
 	{ "uxTopUsedPriority", true }, /* Unavailable since v7.5.3 */
 	{ "xSchedulerRunning", false },
+	{ "pxCurrentTCBs", true },
+	{ "uxTaskNameOffset", true },
 	{ NULL, false }
 };
 
@@ -152,6 +156,11 @@ static int freertos_update_threads(struct rtos *rtos)
 		return -2;
 	}
 
+	if (rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address == 0 && rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address == 0) {
+		LOG_ERROR("Don't have the current TCB in FreeRTOS");
+		return -4;
+	}
+
 	uint32_t thread_list_size = 0;
 	retval = target_read_u32(rtos->target,
 			rtos->symbols[FREERTOS_VAL_UX_CURRENT_NUMBER_OF_TASKS].address,
@@ -168,18 +177,33 @@ static int freertos_update_threads(struct rtos *rtos)
 	/* wipe out previous thread details if any */
 	rtos_free_threadlist(rtos);
 
+	/* find the tcb address for core 0 */
+	uint32_t tcb_address = rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address;
+	if (rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address != 0) {
+		retval = target_read_u32(rtos->target,
+				rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address,
+				&tcb_address);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("Error reading current thread address in FreeRTOS thread list");
+			return retval;
+		}
+		LOG_DEBUG("FreeRTOS: Read pxCurrentTCBs[0] at 0x%" PRIx64 ", value 0x%" PRIx32,
+						rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCBS].address,
+						tcb_address);
+        }
+
 	/* read the current thread */
 	uint32_t pointer_casts_are_bad;
 	retval = target_read_u32(rtos->target,
-			rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address,
+			tcb_address,
 			&pointer_casts_are_bad);
 	if (retval != ERROR_OK) {
 		LOG_ERROR("Error reading current thread in FreeRTOS thread list");
 		return retval;
 	}
 	rtos->current_thread = pointer_casts_are_bad;
-	LOG_DEBUG("FreeRTOS: Read pxCurrentTCB at 0x%" PRIx64 ", value 0x%" PRIx64,
-										rtos->symbols[FREERTOS_VAL_PX_CURRENT_TCB].address,
+	LOG_DEBUG("FreeRTOS: Read pxCurrentTCB at 0x%" PRIx32 ", value 0x%" PRIx64,
+										tcb_address,
 										rtos->current_thread);
 
 	/* read scheduler running */
@@ -263,6 +287,19 @@ static int freertos_update_threads(struct rtos *rtos)
 		return ERROR_FAIL;
 	}
 
+	uint32_t thread_name_offset = param->thread_name_offset;
+	if (rtos->symbols[FREERTOS_VAL_UX_TASK_NAME_OFFSET].address)  {
+		retval = target_read_u32(rtos->target,
+				rtos->symbols[FREERTOS_VAL_UX_TASK_NAME_OFFSET].address,
+				&thread_name_offset);
+		if (retval != ERROR_OK)
+			return retval;
+		LOG_DEBUG("FreeRTOS: Read uxTaskNameOffset at 0x%" PRIx64 ", value 0x%" PRIx32,
+						rtos->symbols[FREERTOS_VAL_UX_TASK_NAME_OFFSET].address,
+						thread_name_offset);
+	}
+
+
 	unsigned int num_lists;
 	for (num_lists = 0; num_lists < config_max_priorities; num_lists++)
 		list_of_lists[num_lists] = rtos->symbols[FREERTOS_VAL_PX_READY_TASKS_LISTS].address +
@@ -332,7 +369,7 @@ static int freertos_update_threads(struct rtos *rtos)
 
 			/* Read the thread name */
 			retval = target_read_buffer(rtos->target,
-					rtos->thread_details[tasks_found].threadid + param->thread_name_offset,
+					rtos->thread_details[tasks_found].threadid + thread_name_offset,
 					FREERTOS_THREAD_NAME_STR_SIZE,
 					(uint8_t *)&tmp_str);
 			if (retval != ERROR_OK) {
@@ -342,7 +379,7 @@ static int freertos_update_threads(struct rtos *rtos)
 			}
 			tmp_str[FREERTOS_THREAD_NAME_STR_SIZE-1] = '\x00';
 			LOG_DEBUG("FreeRTOS: Read Thread Name at 0x%" PRIx64 ", value '%s'",
-										rtos->thread_details[tasks_found].threadid + param->thread_name_offset,
+										rtos->thread_details[tasks_found].threadid + thread_name_offset,
 										tmp_str);
 
 			if (tmp_str[0] == '\x00')
